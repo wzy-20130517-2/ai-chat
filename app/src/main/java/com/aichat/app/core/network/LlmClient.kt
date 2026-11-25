@@ -8,6 +8,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -53,31 +54,34 @@ class LlmClient {
         private const val TAG = "LlmClient"
     }
 
-    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    /**
+     * 序列化配置。
+     *
+     * 【encodeDefaults 必须是 true —— 这个 bug 找了两天】
+     * 它默认是 false，意思是「字段值等于默认值时不写进 JSON」。
+     * 而 ChatRequest.stream 的默认值就是 true，于是 stream:true 被整个省掉，
+     * 请求体里根本没有 stream 字段 → 服务端按非流式处理 →
+     * 返回一整段普通 JSON（没有 `data:` 前缀）→
+     * readNextDataLine 只认 `data:` 开头的行，把它全部跳过 →
+     * contentLen 恒为 0 → 报「返回了空内容」。
+     *
+     * 同样的坑还有 ToolSpec.type = "function"、ChatMessage.role 等带默认值的字段。
+     */
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        encodeDefaults = true
+    }
 
     /**
-     * 首字阶段用的 client：readTimeout = 20 秒。
-     *
-     * 【为什么必须要独立的 client】
-     * withTimeoutOrNull 只能取消协程，**打断不了阻塞中的 socket 读** ——
-     * readUtf8Line() 卡在等内核数据时，协程即使被取消也要等这次 read 返回。
-     * 真正能中断它的是 OkHttp 自己的 readTimeout。
-     *
-     * 所以首字超时交给 readTimeout 来做，而不是协程超时。
+     * 共享的 OkHttpClient。
+     * readTimeout 设成整条流的上限，首字超时由 withTimeoutOrNull 单独控制。
      */
-    private val firstTokenClient = OkHttpClient.Builder()
-        .connectTimeout(Config.CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS)
-        .readTimeout(Config.FIRST_TOKEN_TIMEOUT_SEC, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false)
-        .build()
-
-    /** 首字之后用的 client：readTimeout 放宽到整条流上限。 */
-    private val streamClient = OkHttpClient.Builder()
+    private val client = OkHttpClient.Builder()
         .connectTimeout(Config.CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS)
         .readTimeout(Config.STREAM_TOTAL_TIMEOUT_SEC, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false)
+        .retryOnConnectionFailure(false) // 重试由我们自己控制
         .build()
 
     /**
@@ -195,8 +199,6 @@ class LlmClient {
         var contentLen = 0
         var toolCallCount = 0
         var finishReason = ""
-        // 提到 try 外面：catch 块里也要判断是否已经收到过工具调用
-        val toolAcc = mutableMapOf<Int, ToolAccumulator>()
 
         try {
             val reqBody = ChatRequest(
@@ -221,7 +223,7 @@ class LlmClient {
                 .post(bodyStr.toRequestBody("application/json".toMediaType()))
                 .build()
 
-            val response = firstTokenClient.newCall(request).execute()
+            val response = client.newCall(request).execute()
 
             if (!response.isSuccessful) {
                 val errText = response.body?.string().orEmpty()
@@ -231,18 +233,26 @@ class LlmClient {
             }
 
             val source = response.body!!.source()
+            val toolAcc = mutableMapOf<Int, ToolAccumulator>()
 
             try {
-                // 【2026-11-25 修·最终】
-                // 首字超时交给 OkHttp 的 readTimeout（firstTokenClient 配了 20 秒），
-                // 不再用 withTimeoutOrNull —— 它取消不了阻塞中的 socket 读，
-                // 而且它返回的 null 与「读到 EOF」的 null 无法区分，
-                // 正是上一版「每条消息都报超时」的根因。
-                //
-                // transport 的 SocketTimeoutException 会被下面 catch(IOException) 捕获，
-                // 此时若还没拿到首字，就归类成 FirstTokenTimeout。
-                while (true) {
-                    val line = readNextDataLine(source, json) ?: break
+                while (!source.exhausted()) {
+                    // 首字超时只作用于「还没拿到任何有意义输出」的阶段
+                    val line = if (!gotFirstToken) {
+                        val r = withTimeoutOrNull(Config.FIRST_TOKEN_TIMEOUT_SEC * 1000) {
+                            readNextDataLine(source, json)
+                        }
+                        if (r === TIMEOUT) {
+                            response.close()
+                            return Outcome.FirstTokenTimeout(
+                                "${endpoint.name}（${endpoint.model}）${Config.FIRST_TOKEN_TIMEOUT_SEC}秒无响应",
+                            )
+                        }
+                        r ?: break
+                    } else {
+                        readNextDataLine(source, json) ?: break
+                    }
+
                     if (line == DONE) break
 
                     val chunk = try {
@@ -252,27 +262,7 @@ class LlmClient {
                     }
 
                     val choice = chunk.choices.firstOrNull() ?: continue
-
-                    // 非流式响应（服务端无视 stream=true）把内容放在 message 里，
-                    // 流式放在 delta 里。统一成 delta 的形状处理，两条路都能出字。
-                    val delta = choice.delta ?: choice.message?.let { m ->
-                        Delta(
-                            role = m.role,
-                            content = m.content,
-                            reasoningContent = m.reasoningContent,
-                            toolCalls = m.toolCalls?.mapIndexed { i, tc ->
-                                DeltaToolCall(
-                                    index = i,
-                                    id = tc.id,
-                                    type = tc.type,
-                                    function = DeltaFunction(
-                                        name = tc.function.name,
-                                        arguments = tc.function.arguments,
-                                    ),
-                                )
-                            },
-                        )
-                    }
+                    val delta = choice.delta
 
                     if (delta != null) {
                         // 思维链：只在开启深度思考时展示
@@ -321,24 +311,7 @@ class LlmClient {
 
         } catch (e: CancellationException) {
             throw e
-        } catch (e: java.net.SocketTimeoutException) {
-            // readTimeout 触发。分两种情况：
-            //   还没拿到首字 → 是首字超时，值得重试
-            //   已经在输出中 → 是流中途卡住，按硬失败处理
-            return if (!gotFirstToken) {
-                Outcome.FirstTokenTimeout(
-                    "${endpoint.name}（${endpoint.model}）${Config.FIRST_TOKEN_TIMEOUT_SEC}秒无响应",
-                )
-            } else {
-                Outcome.HardFail("${endpoint.name} 输出中断（连接超时）")
-            }
         } catch (e: IOException) {
-            // 【重要】连接被服务端正常关闭时 OkHttp 可能抛 "unexpected end of stream"，
-            // 这种情况如果已经收到内容，就当作正常结束处理，不该报错。
-            if (gotFirstToken && (contentLen > 0 || toolAcc.isNotEmpty())) {
-                trySend(StreamEvent.Done(finishReason.ifEmpty { "stop" }))
-                return Outcome.Success
-            }
             return Outcome.HardFail("${endpoint.name} 网络错误：${e.message}")
         } catch (e: Exception) {
             Log.e(TAG, "请求异常", e)
@@ -346,51 +319,20 @@ class LlmClient {
         }
     }
 
-    /**
-     * 读下一行 `data:` 内容，跳过空行/心跳/注释行。
-     *
-     * 返回：
-     *   - 非空 payload：正常的 chunk
-     *   - [DONE]：服务端发了 data:[DONE]
-     *   - null：流真的结束了（EOF）
-     *
-     * 注意：跳过心跳行是**内部循环**，不会因为跳过就返回 null ——
-     * 那样会被上层当成「流结束」，长耗时模型（先思考再回答）会在
-     * 首字回来之前就被误判成空回答。
-     */
-    /**
-     * 读下一行待解析的 JSON。
-     *
-     * 两种情况都要能处理：
-     *   1) 标准 SSE：`data: {...}`（本函数剥掉前缀返回 JSON 本体）
-     *   2) 服务端无视 stream=true、直接回一整段普通 JSON
-     *      这种行不以 `data:` 开头，上一版会把它当心跳跳过 →
-     *      读到 EOF 时 contentLen 仍是 0 → 误报「返回了空内容」。
-     *
-     * 按 `Path:`/`X-`/`:` 开头的 SSE 控制行仍然跳过，它们不是数据。
-     */
+    /** 读下一行 data: 内容，跳过空行/心跳/注释。返回 null 表示流结束。 */
     private fun readNextDataLine(
         source: okio.BufferedSource,
         json: Json,
     ): String? {
         while (true) {
+            if (source.exhausted()) return null
             val raw = source.readUtf8Line() ?: return null
-            val trimmed = raw.trim()
-            if (trimmed.isEmpty()) continue
-
-            if (trimmed.startsWith("data:")) {
-                val payload = trimmed.removePrefix("data:").trim()
-                if (payload.isEmpty()) continue
-                if (payload == "[DONE]") return DONE
-                return payload
-            }
-
-            // 非 data: 行：SSE 控制行（event:/id:/retry:/心跳注释）跳过，
-            // 而裸 JSON 直接当数据返回。
-            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                return trimmed
-            }
-            continue
+            if (raw.isBlank()) continue
+            if (!raw.startsWith("data:")) continue // 心跳、注释行
+            val payload = raw.removePrefix("data:").trim()
+            if (payload.isEmpty()) continue
+            if (payload == "[DONE]") return DONE
+            return payload
         }
     }
 
@@ -411,7 +353,7 @@ class LlmClient {
 }
 
 private const val DONE = "__DONE__"
-
+private val TIMEOUT = Any()
 
 /** 累积分片到达的工具调用。 */
 private class ToolAccumulator {
