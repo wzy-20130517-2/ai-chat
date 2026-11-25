@@ -73,28 +73,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var streamJob: Job? = null
     private var recordTimerJob: Job? = null
 
+
     init {
         viewModelScope.launch {
             val settings = store.loadSettings()
-            val convs = store.loadConversations()
+            // 只读摘要，不解析每个会话的消息 —— 会话多了以后全量解析会拖慢启动
+            val metas = store.listSessions()
+            val convs = metas.map { m ->
+                Conversation(
+                    id = m.id,
+                    title = m.title,
+                    messages = emptyList(),   // 消息按需加载
+                    createdAt = m.createdAt,
+                    updatedAt = m.updatedAt,
+                )
+            }
 
             // 恢复上次正在聊的会话。
             // 优先用显式记录的 lastConversationId；它指向的会话可能已被删除，
             // 这时退回到最近更新的那个；都没有才新建。
             val current = convs.firstOrNull { it.id == settings.lastConversationId }
-                ?: convs.maxByOrNull { it.updatedAt }
+                ?: convs.firstOrNull()
 
             _state.value = _state.value.copy(
                 settings = settings,
                 conversations = convs,
                 currentId = current?.id,
-                messages = current?.messages ?: emptyList(),
+                // 只有当前会话需要读消息
+                messages = current?.let { store.loadMessages(it.id) } ?: emptyList(),
             )
 
             if (current == null) {
                 createConversation()
             } else if (current.id != settings.lastConversationId) {
-                // 修正记录，避免下次又走 fallback
                 persistLastConversation(current.id)
             }
         }
@@ -149,21 +160,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             drawerOpen = false,
         )
         persistLastConversation(conv.id)
-        viewModelScope.launch { store.saveConversations(list) }
+        // 空会话不落盘 —— 文件在第一条消息追加时才创建，
+        // 避免点几次「新对话」就在磁盘上堆一串空文件。
     }
 
     fun switchConversation(id: String) {
-        val conv = _state.value.conversations.firstOrNull { it.id == id } ?: return
+        if (_state.value.currentId == id) {
+            _state.value = _state.value.copy(drawerOpen = false)
+            return
+        }
         tts.stop()
         streamJob?.cancel()
         _state.value = _state.value.copy(
             currentId = id,
-            messages = conv.messages,
+            messages = emptyList(),
             input = "",
             isStreaming = false,
             drawerOpen = false,
         )
         persistLastConversation(id)
+        // 消息按需从磁盘读 —— 会话多时不必启动就全量载入
+        viewModelScope.launch {
+            val msgs = store.loadMessages(id)
+            if (_state.value.currentId == id) {
+                _state.value = _state.value.copy(messages = msgs)
+            }
+        }
     }
 
     fun deleteConversation(id: String) {
@@ -175,7 +197,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             messages = if (needNew) emptyList() else _state.value.messages,
         )
         viewModelScope.launch {
-            store.saveConversations(list)
+            store.deleteSession(id)
             if (needNew) createConversation()
         }
     }
@@ -201,7 +223,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         _state.value = _state.value.copy(isStreaming = false)
-        persistCurrent()
+        // 用户主动停止：把最后状态整体落盘（此时消息可能已被上面改成非 streaming）
+        _state.value.currentId?.let { id ->
+            _state.value.conversations.firstOrNull { it.id == id }?.let { c ->
+                val snap = _state.value.messages
+                viewModelScope.launch { store.rewriteSession(c, snap) }
+            }
+        }
     }
 
     // ─────────── 录音 ───────────
@@ -290,21 +318,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             timestamp = System.currentTimeMillis(),
         )
 
-        val updated = _state.value.messages + userMsg
-        _state.value = _state.value.copy(
-            messages = updated,
-            input = "",
-            isStreaming = true,
-            helperText = null,
-        )
-        persistCurrent()
+        _state.value = _state.value.copy(input = "", isStreaming = true, helperText = null)
+        // 立刻落盘：用户消息一敲定就写，不等整轮结束
+        pushMessage(userMsg)
 
-        runTurn(updated)
+        runTurn(_state.value.messages)
     }
 
     fun retry() {
-        // 去掉最后一条助手消息，用现有历史重跑
-        val msgs = _state.value.messages.dropLastWhile { it.role == Role.ASSISTANT }
+        // 去掉最后一轮助手输出，用现有历史重跑。
+        //
+        // 末尾可能是「assistant + 若干 tool」，也可能只有 assistant ——
+        // 要连同它产生的工具消息一起丢掉，否则重跑时会留下孤立的 tool 消息
+        //（协议要求 tool 必须紧跟在带 tool_calls 的 assistant 之后）。
+        val all = _state.value.messages
+        var cut = all.size
+        while (cut > 0 && (all[cut - 1].role == Role.ASSISTANT || all[cut - 1].role == Role.TOOL)) {
+            cut--
+        }
+        val msgs = all.take(cut)
         if (msgs.isEmpty() || _state.value.isStreaming) return
         _state.value = _state.value.copy(messages = msgs, isStreaming = true)
         runTurn(msgs)
@@ -326,9 +358,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     role = Role.ASSISTANT,
                     streaming = true,
                 )
+                // 占位消息只进内存，不进磁盘 —— 它还没有内容。
+                // 等第一条正文/思维链/工具调用到达时再落盘（见下面的 persistAssistantOnce）。
                 _state.value = _state.value.copy(
                     messages = _state.value.messages + assistantMsg,
                 )
+                var assistantPersisted = false
 
                 val working = history.toMutableList()
                 var rounds = 0
@@ -347,9 +382,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     val baseReasoning = assistantMsg.reasoning
 
                     val ttsOn = _state.value.settings.ttsEnabled
-                    if (ttsOn) {
-                        tts.startStream(_state.value.settings.ttsVoice)
-                    }
+                    // 延迟到第一个正文字符才启动朗读。
+                    // 工具轮可能全程没有正文（只返回 tool_calls），提前启动会白跑一次
+                    // startStream + finish，既浪费一次合成又会被下一轮打断。
+                    var ttsStarted = false
 
                     val thinkingOn = _state.value.settings.deepThinking
                     llm.stream(
@@ -362,12 +398,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         when (ev) {
                             is StreamEvent.Content -> {
                                 turnContent.append(ev.text)
-                                if (ttsOn) tts.feed(ev.text)
+                                if (ttsOn) {
+                                    if (!ttsStarted) {
+                                        ttsStarted = true
+                                        tts.startStream(_state.value.settings.ttsVoice)
+                                    }
+                                    tts.feed(ev.text)
+                                }
                                 assistantMsg = assistantMsg.copy(
                                     content = baseContent + turnContent.toString(),
                                     streaming = true,
                                 )
                                 replaceLast(assistantMsg)
+                                if (!assistantPersisted) {
+                                    assistantPersisted = true
+                                    persistAssistant()
+                                }
                             }
 
                             is StreamEvent.Reasoning -> {
@@ -400,7 +446,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
 
-                    if (ttsOn) tts.finish()
+                    if (ttsStarted) tts.finish()
 
                     if (failed) break
 
@@ -449,12 +495,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         replaceLast(assistantMsg)
                     }
 
-                    // 把这一轮的正文和工具结果都并入历史，进入下一轮
+                    // 把这一轮的正文和工具结果都并入历史，进入下一轮。
+                    //
+                    // 【必须带上 toolCalls】OpenAI 协议要求 role=tool 的消息
+                    // 紧跟在一条带 tool_calls 的 assistant 消息之后。
+                    // 之前这里只写了 content、没写 toolCalls，于是：
+                    //   assistant(content="") → tool(结果) → assistant(...)
+                    // 这个形状是非法的，服务端会把 tool 消息忽略掉 ——
+                    // 模型因此完全看不到「自己调用过 open_app、且已成功」，
+                    // 于是反复调用同一个工具。
                     working += Message(
                         id = assistantId + "_r$rounds",
                         role = Role.ASSISTANT,
                         content = turnContent.toString(),
                         reasoning = turnReasoning.toString(),
+                        toolCalls = pendingCalls.map { call ->
+                            ToolCallRecord(
+                                id = call.id,
+                                name = call.function.name,
+                                title = tools.describe(
+                                    call.function.name,
+                                    safeParse(call.function.arguments),
+                                ),
+                                status = ToolStatus.SUCCESS,
+                                result = toolResults.firstOrNull { it.first.id == call.id }
+                                    ?.second.orEmpty(),
+                                arguments = call.function.arguments,
+                            )
+                        },
                     )
                     for ((call, content) in toolResults) {
                         working += Message(
@@ -465,6 +533,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             toolCallId = call.id,
                         )
                     }
+
+                    // 工具轮结束：补写一次助手消息（含正文 + 工具卡片结果 + 工具结果消息）
+                    persistAssistant(toolResults.map { (call, content) ->
+                        Message(
+                            id = call.id,
+                            role = Role.TOOL,
+                            content = content,
+                            toolName = call.function.name,
+                            toolCallId = call.id,
+                        )
+                    })
 
                     // 下一轮的助手消息（可能还有正文+工具）
                     assistantMsg = assistantMsg.copy(streaming = true)
@@ -490,7 +569,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 _state.value = _state.value.copy(isStreaming = false, helperText = null)
             }
-            persistCurrent()
+            // 整轮结束：整体落盘一次，保证最终状态完整
+            _state.value.currentId?.let { id ->
+                _state.value.conversations.firstOrNull { it.id == id }?.let { c ->
+                    val snap = _state.value.messages
+                    viewModelScope.launch { store.rewriteSession(c, snap) }
+                }
+            }
         }
     }
 
@@ -522,7 +607,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                                     id = tc.id,
                                     function = com.aichat.app.core.network.FunctionCall(
                                         name = tc.name,
-                                        arguments = "{}",
+                                        // 用真实参数。写死 "{}" 会让模型回看历史时
+                                        // 看到自己用了空参数，从而重新调用工具。
+                                        arguments = tc.arguments.ifBlank { "{}" },
                                     ),
                                 )
                             }.takeIf { it.isNotEmpty() },
@@ -586,26 +673,89 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun persistCurrent() {
-        val s = _state.value
-        val id = s.currentId ?: return
-        val list = s.conversations.map { c ->
-            if (c.id == id) {
-                c.copy(
-                    messages = s.messages,
-                    updatedAt = System.currentTimeMillis(),
-                    // 标题取第一条用户消息的前 20 字
-                    title = c.title.ifBlank { "新对话" }.let { old ->
-                        if (old == "新对话") {
-                            s.messages.firstOrNull { it.role == Role.USER }
-                                ?.content?.take(20)?.ifBlank { "新对话" } ?: "新对话"
-                        } else old
-                    },
-                )
-            } else c
+    /**
+     * 落盘助手消息（可能被后续轮次继续追加内容）。
+     *
+     * 【为什么单独一条路】用户消息和工具消息是「一次定型」的，追加即可。
+     * 助手消息会经历「正文 → 工具调用 → 再正文」多次变化，
+     * 追加式写会留下多个半成品版本。所以对它采用「重写整个文件」——
+     * 一次会话里这种重写最多每轮一次（工具轮数上限 8），成本可接受。
+     */
+    private fun persistAssistant(toolMessages: List<Message> = emptyList()) {
+        val id = _state.value.currentId ?: return
+        val conv = _state.value.conversations.firstOrNull { it.id == id } ?: return
+
+        // 落盘时要把工具消息拼进去。
+        //
+        // 【为什么 UI 状态里没有它们】Role.TOOL 是「喂给模型」的内部消息，
+        // 显示在气泡里没有意义（工具结果已经由助手消息的 toolCalls 卡片呈现）。
+        // 但**必须存盘** —— 否则会话恢复后模型看不到自己调用过什么，
+        // 会重新调用同一个工具（「让它打开微信，它反复调用」就是这个原因）。
+        // 所以 UI 只存可见消息，磁盘存「可见消息 + 工具消息」。
+        // 工具消息必须排在「本条助手消息」之前：
+        // 正确的顺序是 assistant(带 tool_calls) → tool(结果) → assistant(最终正文)。
+        // 而 _state.messages 的最后一条正是本条助手消息（会被持续更新），
+        // 所以把它拆出来放到工具消息后面。
+        val all = _state.value.messages
+        val snapshot = if (toolMessages.isEmpty()) {
+            all
+        } else {
+            val last = all.lastOrNull()
+            if (last != null && last.role == Role.ASSISTANT) {
+                all.dropLast(1) + toolMessages + last
+            } else {
+                all + toolMessages
+            }
         }
-        _state.value = _state.value.copy(conversations = list)
-        viewModelScope.launch { store.saveConversations(list) }
+
+        viewModelScope.launch {
+            store.rewriteSession(conv, snapshot)
+        }
+    }
+
+    /**
+     * 往对话流里压一条消息，并**立刻**落盘。
+     *
+     * 对齐 CCM CLI 的 Agent._pushMessage：每条消息一产生就 appendMessage，
+     * 所以「工具跑到一半进程挂了」最多丢当前那一条，不会像攒批那样整轮全丢。
+     * 这是唯一的高频写盘点。
+     */
+    private fun pushMessage(msg: Message) {
+        val id = _state.value.currentId ?: return
+        _state.value = _state.value.copy(messages = _state.value.messages + msg)
+
+        val conv = _state.value.conversations.firstOrNull { it.id == id } ?: return
+        val title = computeTitle(conv.title, _state.value.messages)
+        if (title != conv.title) {
+            _state.value = _state.value.copy(
+                conversations = _state.value.conversations.map {
+                    if (it.id == id) it.copy(title = title, updatedAt = System.currentTimeMillis()) else it
+                },
+            )
+        }
+
+        // 用户消息用 append（增量写，O(1)）。
+        //
+        // 【为什么这里不用 rewrite】用户消息是「一次定型」的，追加即可，
+        // 没必要为它重写整份历史（几百条时是几百 KB）。
+        // 助手消息会反复变化，那条路才用 rewrite（见 persistAssistant）。
+        //
+        // 【顺序问题怎么解决】写操作在 Store 内部有 Mutex 串行化；
+        // 且 rewrite 写的是「当前完整内存状态」，本来就把用户消息包含在内，
+        // 所以即使 rewrite 后执行，内容也不会丢。
+        val updatedConv = _state.value.conversations.firstOrNull { it.id == id } ?: conv
+        viewModelScope.launch {
+            store.appendMessage(updatedConv, msg)
+            store.updateMeta(id, title = updatedConv.title, updatedAt = updatedConv.updatedAt)
+            store.prune(keepId = id)
+        }
+    }
+
+    /** 标题取第一条用户消息前 20 字；已有标题不覆盖。 */
+    private fun computeTitle(current: String, messages: List<Message>): String {
+        if (current.isNotBlank() && current != "新对话") return current
+        val first = messages.firstOrNull { it.role == Role.USER }?.content?.trim()
+        return first?.take(20)?.ifBlank { "新对话" } ?: "新对话"
     }
 
     override fun onCleared() {
