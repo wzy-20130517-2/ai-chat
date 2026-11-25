@@ -55,6 +55,15 @@ class Store(private val context: Context) {
         explicitNulls = false
     }
 
+    /**
+     * 会话写入串行化。
+     *
+     * appendMessage 是追加、rewriteSession 是整份覆盖，两者并发写同一文件会互相破坏：
+     * 覆盖进行到一半时追加进来的行会被下一次覆盖丢掉，或者追加的内容夹在半个文件中间。
+     * 用单线程上下文把所有写操作排队，代价是每次几毫秒，换来不会静默丢消息。
+     */
+    private val writeLock = kotlinx.coroutines.sync.Mutex()
+
     private val sessionsDir: File
         get() = File(context.filesDir, SESSIONS_DIR).also { if (!it.exists()) it.mkdirs() }
 
@@ -70,7 +79,7 @@ class Store(private val context: Context) {
     suspend fun appendMessage(
         conversation: Conversation,
         message: Message,
-    ) = withContext(Dispatchers.IO) {
+    ) = writeLock.withLock { withContext(Dispatchers.IO) {
         val f = fileOf(conversation.id)
         try {
             if (!f.exists()) {
@@ -87,7 +96,7 @@ class Store(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "追加消息失败 ${conversation.id}", e)
         }
-    }
+    } }
 
     /**
      * 重写整个会话文件（meta 行 + 全部消息）。
@@ -101,7 +110,7 @@ class Store(private val context: Context) {
     suspend fun rewriteSession(
         conversation: Conversation,
         messages: List<Message>,
-    ) = withContext(Dispatchers.IO) {
+    ) = writeLock.withLock { withContext(Dispatchers.IO) {
         val f = fileOf(conversation.id)
         try {
             val sb = StringBuilder()
@@ -120,7 +129,7 @@ class Store(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "重写会话失败 ${conversation.id}", e)
         }
-    }
+    } }
 
     /**
      * 更新元数据（标题 / 时间），不动消息流。
@@ -179,11 +188,6 @@ class Store(private val context: Context) {
                 val lines = f.readLines()
                 if (lines.isEmpty()) return@null null
                 val head = json.parseToJsonElement(lines[0]).jsonObject
-                if (head[META_KEY]?.jsonPrimitive?.content != "true" &&
-                    head[META_KEY]?.jsonPrimitive?.content?.toBoolean() != true
-                ) {
-                    // 兼容：首行不是 meta 说明是老格式/异常文件，仍然读出来
-                }
                 SessionMeta(
                     id = head["id"]?.jsonPrimitive?.content ?: f.nameWithoutExtension,
                     title = head["title"]?.jsonPrimitive?.content ?: "新对话",
@@ -235,6 +239,11 @@ class Store(private val context: Context) {
                     null
                 }
             }
+            // 注意：这里**不能**过滤 Role.TOOL。
+            // OpenAI 协议要求「带 tool_calls 的 assistant 消息」后面必须紧跟
+            // 对应的 role=tool 消息，否则服务端会报错或忽略那些 tool_calls ——
+            // 模型于是看不到自己调用过什么，重启后会重复调用同一个工具。
+            // UI 那端的过滤放在渲染层做（ChatScreen 的 items）。
         } catch (e: Exception) {
             Log.e(TAG, "读取会话失败 $id", e)
             emptyList()
