@@ -86,7 +86,7 @@ object Config {
 
     // ─────────────── 联网搜索（Tavily） ───────────────
 
-    const val TAVILY_API_KEY = "tvly-REPLACE_ME"
+    const val TAVILY_API_KEY = "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"
     const val TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
     /** ultra-fast：延迟最低，每个结果一个摘要片段。 */
