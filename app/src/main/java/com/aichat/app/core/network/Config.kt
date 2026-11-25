@@ -58,6 +58,13 @@ object Config {
     /** 整条流的总超时（秒）。防止一直不断但极慢地吐字。 */
     const val STREAM_TOTAL_TIMEOUT_SEC = 300L
 
+    /**
+     * 单次回复的 max_tokens。
+     *
+     * 32768：长回答（含代码）留足空间，同时不至于把中转站的额度一次吃光。
+     */
+    const val MAX_OUTPUT_TOKENS = 32_768
+
     /** 单轮对话最多几轮工具调用（防止模型死循环调工具）。 */
     const val MAX_TOOL_ROUNDS = 8
 
