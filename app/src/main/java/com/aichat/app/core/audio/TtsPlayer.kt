@@ -47,6 +47,15 @@ class TtsPlayer(private val cacheDir: File) {
     @Volatile
     private var generation = 0
 
+    /**
+     * 合成/播放失败时的回调，用于把原因显示给用户。
+     *
+     * 【为什么需要】TTS 是「没有反馈」的功能 —— 合成失败时用户只听到安静，
+     * 完全不知道是签名错了、网络不通、还是语音名不对。
+     * 把错误抛到界面上（输入框上方的提示条），比静默失败好得多。
+     */
+    var onError: ((String) -> Unit)? = null
+
     /** 流式朗读时接收文本增量的通道。null 表示当前不在朗读。 */
     @Volatile
     private var feedChannel: Channel<String>? = null
@@ -82,6 +91,8 @@ class TtsPlayer(private val cacheDir: File) {
                         if (client.synthesize(part, f, voice = voice)) {
                             audioQueue.send(f)
                             isFirst = false
+                        } else {
+                            onError?.invoke("语音合成失败")
                         }
                     }
                 }
