@@ -107,12 +107,15 @@ class EdgeTtsClient(
                 if (data.size < 2 + headerLen) return
                 val header = String(data, 2, headerLen, Charsets.UTF_8)
 
-                if (header.contains("Path:audio", ignoreCase = true)) {
-                    // 音频数据从 2+headerLen 开始
-                    if (data.size > 2 + headerLen) {
-                        synchronized(mp3) {
-                            mp3.write(data, 2 + headerLen, data.size - 2 - headerLen)
-                        }
+                // 【不要按帧头内容过滤】原来的写法是
+                //   if (header.contains("Path:audio")) { 写音频 }
+                // 但服务端的二进制帧头格式并不保证含这个字符串（实测 CCM 的
+                // Node 实现直接取所有二进制帧的数据、不看头内容，一直正常）。
+                // 加了过滤反而有「服务端改了头 → 音频全丢 → 播放无声」的风险。
+                // 与 CCM 保持一致：所有二进制帧都是「2 字节头长 + 音频数据」。
+                if (data.size > 2 + headerLen) {
+                    synchronized(mp3) {
+                        mp3.write(data, 2 + headerLen, data.size - 2 - headerLen)
                     }
                 }
             }
@@ -143,11 +146,13 @@ class EdgeTtsClient(
             return false
         }
 
-        if (!ok.get()) return false
-
         val audio = synchronized(mp3) { mp3.toByteArray() }
+
+        // 【不强制要求收到 turn.end】正常流程是「收完音频 → turn.end → 结束」，
+        // 但如果服务端提前 close 或 turn.end 帧丢了，音频其实已经收全了。
+        // 只要拿到了非空音频就照常使用，避免「明明合成成功却判定失败」。
         if (audio.isEmpty()) {
-            Log.e(TAG, "合成结果为空")
+            Log.e(TAG, "合成结果为空（turn.end=${ok.get()}）")
             return false
         }
 
