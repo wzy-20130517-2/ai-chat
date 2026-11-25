@@ -220,36 +220,28 @@ private fun TopBar(
     onOpenDrawer: () -> Unit,
 ) {
     val colors = LocalChatColors.current
-    // 顶栏要避让状态栏：之前直接把 Row 放在 Column 顶部，
-    // edge-to-edge 下整条会顶到屏幕最上沿，按钮被状态栏盖住点不到。
-    Box(
+    // 顶栏避让状态栏：edge-to-edge 下直接放在 Column 顶部会顶到屏幕最上沿，
+    // 按钮被状态栏盖住点不到。
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .height(52.dp),
+            .height(52.dp)
+            .padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        // 标题用「整行居中」而不是 weight 占位居中。
-        // 左边 1 个图标、右边 2 个图标，weight(1f) 会让文字落在剩余空间的中心，
-        // 视觉上明显偏右。直接铺满整行居中才和 ChatGPT 一致。
-        Text(
-            text = title,
-            style = ChatText.title,
-            color = colors.textPrimary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                // 左右各留出按钮宽度，避免长标题压到图标上
-                .padding(horizontal = 52.dp)
-                .align(Alignment.Center),
-        )
+        // 【2026-11-25 修重叠】
+        // 之前左侧菜单和右侧按钮分别放在两个 fillMaxWidth() 的 Row 里，
+        // 两个 Row 都铺满整行、互相叠在对方上面 —— 左侧那个透明的 Row
+        // 盖住了右侧按钮的点击区，表现就是「点 TTS 却打开了侧栏」。
+        //
+        // 现在改成单个 Row：左右两侧各占固定宽度（各 2 个 40dp 槽位），
+        // 标题用 weight(1f) 吃掉中间剩余空间并居中。
+        // 两边等宽，标题才是真居中，不是「剩余空间的中心」。
 
+        // 左侧槽位：菜单按钮 + 一个空槽（与右侧两个按钮对齐）
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp)
-                .align(Alignment.CenterStart),
+            modifier = Modifier.width(88.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -267,11 +259,23 @@ private fun TopBar(
             }
         }
 
-        Row(
+        // 标题：占中间剩余空间并居中
+        Text(
+            text = title,
+            style = ChatText.title,
+            color = colors.textPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp)
-                .align(Alignment.CenterEnd),
+                .weight(1f)
+                .padding(horizontal = 4.dp),
+        )
+
+        // 右侧槽位：朗读 + 新对话（两个 40dp，与左侧宽度对称）
+        Row(
+            modifier = Modifier.width(88.dp),
+            horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -306,7 +310,6 @@ private fun TopBar(
     }
 }
 
-/** 空会话时的引导语。 */
 @Composable
 private fun EmptyState(colors: com.aichat.app.ui.theme.ChatColors) {
     Box(
