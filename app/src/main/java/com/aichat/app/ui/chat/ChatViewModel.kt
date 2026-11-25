@@ -188,6 +188,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         streamJob?.cancel()
         streamJob = null
         tts.stop()
+
+        // 【2026-11-25 修】只置 isStreaming 不够 —— 助手气泡的「三个点」动画
+        // 看的是 message.streaming，取消后那条消息仍带着 streaming=true，
+        // 于是全局已经停了、气泡还在转。
+        // 这里把最后一条助手消息的 streaming 一并清掉。
+        val list = _state.value.messages.toMutableList()
+        val last = list.lastOrNull()
+        if (last != null && last.role == Role.ASSISTANT && last.streaming) {
+            list[list.lastIndex] = last.copy(streaming = false)
+            _state.value = _state.value.copy(messages = list)
+        }
+
         _state.value = _state.value.copy(isStreaming = false)
         persistCurrent()
     }
@@ -307,165 +319,177 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun runTurn(history: List<Message>) {
         streamJob = viewModelScope.launch {
-            val assistantId = UUID.randomUUID().toString()
-            var assistantMsg = Message(
-                id = assistantId,
-                role = Role.ASSISTANT,
-                streaming = true,
-            )
-            _state.value = _state.value.copy(
-                messages = _state.value.messages + assistantMsg,
-            )
-
-            val working = history.toMutableList()
-            var rounds = 0
-
-            while (rounds < Config.MAX_TOOL_ROUNDS) {
-                rounds++
-                var turnContent = StringBuilder()
-                var turnReasoning = StringBuilder()
-                val pendingCalls = mutableListOf<ToolCall>()
-                var failed = false
-
-                // 每轮从「空内容」起算。重试时 LlmClient 内部可能已经跑过几次，
-                // 但那些内容不会到我们这里 —— 我们只在真正收到时累积。
-                // 这里显式清空可以避免上一轮正文串到这一轮。
-                val baseContent = assistantMsg.content
-                val baseReasoning = assistantMsg.reasoning
-
-                val ttsOn = _state.value.settings.ttsEnabled
-                if (ttsOn) {
-                    tts.startStream(_state.value.settings.ttsVoice)
-                }
-
-                val thinkingOn = _state.value.settings.deepThinking
-                llm.stream(
-                    messages = buildApiMessages(working),
-                    tools = tools.specs(),
-                    deepThinking = thinkingOn,
-                    // 关闭思考时即使模型返回思维链也不展示（部分站默认会返回）
-                    hideReasoning = !thinkingOn,
-                ).collect { ev ->
-                    when (ev) {
-                        is StreamEvent.Content -> {
-                            turnContent.append(ev.text)
-                            if (ttsOn) tts.feed(ev.text)
-                            assistantMsg = assistantMsg.copy(
-                                content = baseContent + turnContent.toString(),
-                                streaming = true,
-                            )
-                            replaceLast(assistantMsg)
-                        }
-
-                        is StreamEvent.Reasoning -> {
-                            turnReasoning.append(ev.text)
-                            assistantMsg = assistantMsg.copy(
-                                reasoning = baseReasoning + turnReasoning.toString(),
-                                streaming = true,
-                            )
-                            replaceLast(assistantMsg)
-                        }
-
-                        is StreamEvent.ToolCalls -> {
-                            pendingCalls += ev.calls
-                        }
-
-                        is StreamEvent.Retrying -> {
-                            _state.value = _state.value.copy(helperText = ev.message)
-                        }
-
-                        is StreamEvent.Failed -> {
-                            assistantMsg = assistantMsg.copy(
-                                streaming = false,
-                                error = ev.message,
-                            )
-                            replaceLast(assistantMsg)
-                            failed = true
-                        }
-
-                        is StreamEvent.Done -> Unit
-                    }
-                }
-
-                if (ttsOn) tts.finish()
-
-                if (failed) break
-
-                // 没有工具调用 → 这一轮就是最终回复
-                if (pendingCalls.isEmpty()) {
-                    assistantMsg = assistantMsg.copy(streaming = false)
-                    replaceLast(assistantMsg)
-                    break
-                }
-
-                // ── 执行工具 ──
-                val records = mutableListOf<ToolCallRecord>()
-                val toolResults = mutableListOf<Pair<ToolCall, String>>()
-
-                for (call in pendingCalls) {
-                    val record = ToolCallRecord(
-                        id = call.id,
-                        name = call.function.name,
-                        title = tools.describe(
-                            call.function.name,
-                            safeParse(call.function.arguments),
-                        ),
-                        status = ToolStatus.RUNNING,
-                    )
-                    records += record
-                }
-                assistantMsg = assistantMsg.copy(
-                    toolCalls = assistantMsg.toolCalls + records,
-                )
-                replaceLast(assistantMsg)
-
-                for ((idx, call) in pendingCalls.withIndex()) {
-                    val result = tools.execute(call.function.name, call.function.arguments)
-                    toolResults += call to result.content
-
-                    val updatedRecords = assistantMsg.toolCalls.map {
-                        if (it.id == call.id) {
-                            it.copy(
-                                status = if (result.ok) ToolStatus.SUCCESS else ToolStatus.FAILED,
-                                title = result.displayTitle,
-                                result = result.content,
-                            )
-                        } else it
-                    }
-                    assistantMsg = assistantMsg.copy(toolCalls = updatedRecords)
-                    replaceLast(assistantMsg)
-                }
-
-                // 把这一轮的正文和工具结果都并入历史，进入下一轮
-                working += Message(
-                    id = assistantId + "_r$rounds",
+            try {
+                val assistantId = UUID.randomUUID().toString()
+                var assistantMsg = Message(
+                    id = assistantId,
                     role = Role.ASSISTANT,
-                    content = turnContent.toString(),
-                    reasoning = turnReasoning.toString(),
+                    streaming = true,
                 )
-                for ((call, content) in toolResults) {
-                    working += Message(
-                        id = call.id,
-                        role = Role.TOOL,
-                        content = content,
-                        toolName = call.function.name,
-                        toolCallId = call.id,
+                _state.value = _state.value.copy(
+                    messages = _state.value.messages + assistantMsg,
+                )
+
+                val working = history.toMutableList()
+                var rounds = 0
+
+                while (rounds < Config.MAX_TOOL_ROUNDS) {
+                    rounds++
+                    var turnContent = StringBuilder()
+                    var turnReasoning = StringBuilder()
+                    val pendingCalls = mutableListOf<ToolCall>()
+                    var failed = false
+
+                    // 每轮从「空内容」起算。重试时 LlmClient 内部可能已经跑过几次，
+                    // 但那些内容不会到我们这里 —— 我们只在真正收到时累积。
+                    // 这里显式清空可以避免上一轮正文串到这一轮。
+                    val baseContent = assistantMsg.content
+                    val baseReasoning = assistantMsg.reasoning
+
+                    val ttsOn = _state.value.settings.ttsEnabled
+                    if (ttsOn) {
+                        tts.startStream(_state.value.settings.ttsVoice)
+                    }
+
+                    val thinkingOn = _state.value.settings.deepThinking
+                    llm.stream(
+                        messages = buildApiMessages(working),
+                        tools = tools.specs(),
+                        deepThinking = thinkingOn,
+                        // 关闭思考时即使模型返回思维链也不展示（部分站默认会返回）
+                        hideReasoning = !thinkingOn,
+                    ).collect { ev ->
+                        when (ev) {
+                            is StreamEvent.Content -> {
+                                turnContent.append(ev.text)
+                                if (ttsOn) tts.feed(ev.text)
+                                assistantMsg = assistantMsg.copy(
+                                    content = baseContent + turnContent.toString(),
+                                    streaming = true,
+                                )
+                                replaceLast(assistantMsg)
+                            }
+
+                            is StreamEvent.Reasoning -> {
+                                turnReasoning.append(ev.text)
+                                assistantMsg = assistantMsg.copy(
+                                    reasoning = baseReasoning + turnReasoning.toString(),
+                                    streaming = true,
+                                )
+                                replaceLast(assistantMsg)
+                            }
+
+                            is StreamEvent.ToolCalls -> {
+                                pendingCalls += ev.calls
+                            }
+
+                            is StreamEvent.Retrying -> {
+                                _state.value = _state.value.copy(helperText = ev.message)
+                            }
+
+                            is StreamEvent.Failed -> {
+                                assistantMsg = assistantMsg.copy(
+                                    streaming = false,
+                                    error = ev.message,
+                                )
+                                replaceLast(assistantMsg)
+                                failed = true
+                            }
+
+                            is StreamEvent.Done -> Unit
+                        }
+                    }
+
+                    if (ttsOn) tts.finish()
+
+                    if (failed) break
+
+                    // 没有工具调用 → 这一轮就是最终回复
+                    if (pendingCalls.isEmpty()) {
+                        assistantMsg = assistantMsg.copy(streaming = false)
+                        replaceLast(assistantMsg)
+                        break
+                    }
+
+                    // ── 执行工具 ──
+                    val records = mutableListOf<ToolCallRecord>()
+                    val toolResults = mutableListOf<Pair<ToolCall, String>>()
+
+                    for (call in pendingCalls) {
+                        val record = ToolCallRecord(
+                            id = call.id,
+                            name = call.function.name,
+                            title = tools.describe(
+                                call.function.name,
+                                safeParse(call.function.arguments),
+                            ),
+                            status = ToolStatus.RUNNING,
+                        )
+                        records += record
+                    }
+                    assistantMsg = assistantMsg.copy(
+                        toolCalls = assistantMsg.toolCalls + records,
                     )
+                    replaceLast(assistantMsg)
+
+                    for ((idx, call) in pendingCalls.withIndex()) {
+                        val result = tools.execute(call.function.name, call.function.arguments)
+                        toolResults += call to result.content
+
+                        val updatedRecords = assistantMsg.toolCalls.map {
+                            if (it.id == call.id) {
+                                it.copy(
+                                    status = if (result.ok) ToolStatus.SUCCESS else ToolStatus.FAILED,
+                                    title = result.displayTitle,
+                                    result = result.content,
+                                )
+                            } else it
+                        }
+                        assistantMsg = assistantMsg.copy(toolCalls = updatedRecords)
+                        replaceLast(assistantMsg)
+                    }
+
+                    // 把这一轮的正文和工具结果都并入历史，进入下一轮
+                    working += Message(
+                        id = assistantId + "_r$rounds",
+                        role = Role.ASSISTANT,
+                        content = turnContent.toString(),
+                        reasoning = turnReasoning.toString(),
+                    )
+                    for ((call, content) in toolResults) {
+                        working += Message(
+                            id = call.id,
+                            role = Role.TOOL,
+                            content = content,
+                            toolName = call.function.name,
+                            toolCallId = call.id,
+                        )
+                    }
+
+                    // 下一轮的助手消息（可能还有正文+工具）
+                    assistantMsg = assistantMsg.copy(streaming = true)
                 }
 
-                // 下一轮的助手消息（可能还有正文+工具）
-                assistantMsg = assistantMsg.copy(streaming = true)
-            }
+                if (rounds >= Config.MAX_TOOL_ROUNDS) {
+                    assistantMsg = assistantMsg.copy(
+                        streaming = false,
+                        error = "工具调用次数过多，已停止。",
+                    )
+                    replaceLast(assistantMsg)
+                }
 
-            if (rounds >= Config.MAX_TOOL_ROUNDS) {
-                assistantMsg = assistantMsg.copy(
-                    streaming = false,
-                    error = "工具调用次数过多，已停止。",
-                )
-                replaceLast(assistantMsg)
+            } finally {
+                // 协程被取消（用户点停止）时会跳过上面所有收尾逻辑，
+                // 所以 isStreaming / message.streaming 必须在这里兜底清掉，
+                // 否则发送按钮会一直显示成「停止」、气泡三个点继续动画。
+                val l = _state.value.messages.toMutableList()
+                val last = l.lastOrNull()
+                if (last != null && last.role == Role.ASSISTANT && last.streaming) {
+                    l[l.lastIndex] = last.copy(streaming = false)
+                    _state.value = _state.value.copy(messages = l)
+                }
+                _state.value = _state.value.copy(isStreaming = false, helperText = null)
             }
-
-            _state.value = _state.value.copy(isStreaming = false, helperText = null)
             persistCurrent()
         }
     }
