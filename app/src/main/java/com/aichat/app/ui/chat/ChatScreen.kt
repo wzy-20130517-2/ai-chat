@@ -153,7 +153,10 @@ fun ChatScreen(
                 }
 
                 // 脱离跟随时浮现的「回到底部」
-                AnimatedVisibility(
+                // 显式写全包名：import 的 AnimatedVisibility 是 ColumnScope 上的扩展版，
+                // 而这里在 Box 作用域里（外层虽然有个 Column，但那是另一个层）——
+                // 不限定会报「cannot be called with an implicit receiver」。
+                androidx.compose.animation.AnimatedVisibility(
                     visible = !shouldFollow,
                     enter = slideInVertically(initialOffsetY = { it }),
                     exit = slideOutVertically(targetOffsetY = { it }),

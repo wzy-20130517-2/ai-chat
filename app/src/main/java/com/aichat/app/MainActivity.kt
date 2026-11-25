@@ -7,16 +7,24 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import com.aichat.app.ui.chat.ChatDrawer
 import com.aichat.app.ui.chat.ChatScreen
 import com.aichat.app.ui.chat.ChatViewModel
-import com.aichat.app.ui.chat.RecordingState
-import com.aichat.app.ui.chat.InputBar
 import com.aichat.app.ui.theme.AIChatTheme
 import com.aichat.app.ui.theme.LocalChatColors
 
@@ -25,11 +33,10 @@ class MainActivity : ComponentActivity() {
     private val vm: ChatViewModel by viewModels()
 
     /**
-     * 音视频 + 通讯录 + 电话权限统一申请。
+     * 录音 / 通讯录 / 电话权限一次要齐。
      *
-     * 一次要齐：录音（语音输入）、通讯录（按名字打电话）、电话（直接拨出）。
-     * 分开申请会让用户在不同时机被弹三次框，体验更差。
-     * 用户拒绝也不阻塞使用 —— 对应功能会返回明确的「缺少权限」提示。
+     * 分三次弹框对用户更烦；一起申请，拒绝某项只是那个功能不可用，
+     * 对应工具会返回明确的「缺少权限」而不是崩。
      */
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -81,6 +88,40 @@ class MainActivity : ComponentActivity() {
                         onOpenDrawer = { vm.openDrawer(true) },
                         onRetry = vm::retry,
                     )
+
+                    // ── 会话抽屉 ──
+                    AnimatedVisibility(
+                        visible = state.drawerOpen,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.35f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                ) { vm.openDrawer(false) },
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = state.drawerOpen,
+                        enter = slideInHorizontally(initialOffsetX = { -it }),
+                        exit = slideOutHorizontally(targetOffsetX = { -it }),
+                    ) {
+                        ChatDrawer(
+                            conversations = state.conversations,
+                            currentId = state.currentId,
+                            themeMode = state.settings.themeMode,
+                            onSelect = vm::switchConversation,
+                            onDelete = vm::deleteConversation,
+                            onNewChat = vm::createConversation,
+                            onThemeChange = vm::setThemeMode,
+                            onClose = { vm.openDrawer(false) },
+                        )
+                    }
                 }
             }
         }
