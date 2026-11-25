@@ -51,8 +51,6 @@ class TtsPlayer(private val cacheDir: File) {
     @Volatile
     private var feedChannel: Channel<String>? = null
 
-    val isPlaying: Boolean get() = playing.get()
-
     /**
      * 开始流式朗读。之后每段文本用 [feed] 送入，全部送完后调 [finish]。
      *
@@ -139,13 +137,6 @@ class TtsPlayer(private val cacheDir: File) {
     fun finish() {
         feedChannel?.close()
         feedChannel = null
-    }
-
-    /** 一次性朗读整段文本（非流式场景，如重播某条回复）。 */
-    fun speak(text: String, voice: String) {
-        startStream(voice)
-        feed(TtsSegmenter.clean(text))
-        finish()
     }
 
     private suspend fun playFile(file: File) = withContext(Dispatchers.IO) {
