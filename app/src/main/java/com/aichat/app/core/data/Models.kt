@@ -43,6 +43,13 @@ data class ToolCallRecord(
     val title: String,
     val status: ToolStatus = ToolStatus.RUNNING,
     val result: String = "",
+    /**
+     * 模型调用这个工具时用的原始参数（JSON 串）。
+     *
+     * 必须存下来：多轮工具调用时要把 assistant 的 tool_calls 原样回传给服务端，
+     * 参数写死成 "{}" 会让模型以为上次调用没带参数，从而重复调用同一个工具。
+     */
+    val arguments: String = "",
 )
 
 @Serializable
