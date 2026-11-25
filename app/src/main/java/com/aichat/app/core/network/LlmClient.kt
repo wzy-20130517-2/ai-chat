@@ -219,19 +219,29 @@ class LlmClient {
             val toolAcc = mutableMapOf<Int, ToolAccumulator>()
 
             try {
-                while (!source.exhausted()) {
-                    // 首字超时只作用于「还没拿到任何有意义输出」的阶段
+                // 【2026-11-25 改】不用 `while (!source.exhausted())`。
+                // exhausted() 在流式连接上语义不可靠：数据尚未到达时它可能
+                // 立刻返回 true（表现为整个循环一次都不执行 → 判定空回答）。
+                // 改成无限循环，靠 readNextDataLine 返回 null 来识别真正的 EOF。
+                while (true) {
+                    // 首字超时只作用于「还没拿到任何有意义输出」的阶段。
+                    //
+                    // 【2026-11-25 修】原来写的是 `if (r === TIMEOUT)` ——
+                    // withTimeoutOrNull 超时返回的是 null，永远不会等于那个哨兵对象，
+                    // 于是超时被当成「流结束」直接 break，上层判定成空回答。
+                    // 现在先用一个可区分的包装，把「超时」和「流正常结束」分开。
                     val line = if (!gotFirstToken) {
                         val r = withTimeoutOrNull(Config.FIRST_TOKEN_TIMEOUT_SEC * 1000) {
                             readNextDataLine(source, json)
                         }
-                        if (r === TIMEOUT) {
-                            response.close()
+                        if (r === null) {
+                            // 20 秒没等到第一个 data 行 —— 这才是超时
+                            runCatching { response.close() }
                             return Outcome.FirstTokenTimeout(
                                 "${endpoint.name}（${endpoint.model}）${Config.FIRST_TOKEN_TIMEOUT_SEC}秒无响应",
                             )
                         }
-                        r ?: break
+                        r
                     } else {
                         readNextDataLine(source, json) ?: break
                     }
@@ -302,16 +312,26 @@ class LlmClient {
         }
     }
 
-    /** 读下一行 data: 内容，跳过空行/心跳/注释。返回 null 表示流结束。 */
+    /**
+     * 读下一行 `data:` 内容，跳过空行/心跳/注释行。
+     *
+     * 返回：
+     *   - 非空 payload：正常的 chunk
+     *   - [DONE]：服务端发了 data:[DONE]
+     *   - null：流真的结束了（EOF）
+     *
+     * 注意：跳过心跳行是**内部循环**，不会因为跳过就返回 null ——
+     * 那样会被上层当成「流结束」，长耗时模型（先思考再回答）会在
+     * 首字回来之前就被误判成空回答。
+     */
     private fun readNextDataLine(
         source: okio.BufferedSource,
         json: Json,
     ): String? {
         while (true) {
-            if (source.exhausted()) return null
             val raw = source.readUtf8Line() ?: return null
             if (raw.isBlank()) continue
-            if (!raw.startsWith("data:")) continue // 心跳、注释行
+            if (!raw.startsWith("data:")) continue
             val payload = raw.removePrefix("data:").trim()
             if (payload.isEmpty()) continue
             if (payload == "[DONE]") return DONE
@@ -336,7 +356,6 @@ class LlmClient {
 }
 
 private const val DONE = "__DONE__"
-private val TIMEOUT = Any()
 
 /** 累积分片到达的工具调用。 */
 private class ToolAccumulator {
