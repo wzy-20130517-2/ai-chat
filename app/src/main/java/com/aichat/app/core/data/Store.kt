@@ -3,6 +3,8 @@ package com.aichat.app.core.data
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
@@ -79,7 +81,7 @@ class Store(private val context: Context) {
     suspend fun appendMessage(
         conversation: Conversation,
         message: Message,
-    ) = writeLock.withLock { withContext(Dispatchers.IO) {
+    ) = withContext(Dispatchers.IO) { writeLock.withLock {
         val f = fileOf(conversation.id)
         try {
             if (!f.exists()) {
@@ -110,7 +112,7 @@ class Store(private val context: Context) {
     suspend fun rewriteSession(
         conversation: Conversation,
         messages: List<Message>,
-    ) = writeLock.withLock { withContext(Dispatchers.IO) {
+    ) = withContext(Dispatchers.IO) { writeLock.withLock {
         val f = fileOf(conversation.id)
         try {
             val sb = StringBuilder()
@@ -186,7 +188,7 @@ class Store(private val context: Context) {
         files.mapNotNull { f ->
             try {
                 val lines = f.readLines()
-                if (lines.isEmpty()) return@null null
+                if (lines.isEmpty()) return@mapNotNull null
                 val head = json.parseToJsonElement(lines[0]).jsonObject
                 SessionMeta(
                     id = head["id"]?.jsonPrimitive?.content ?: f.nameWithoutExtension,
