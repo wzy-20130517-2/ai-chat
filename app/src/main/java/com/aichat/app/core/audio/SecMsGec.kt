@@ -25,6 +25,10 @@ object SecMsGec {
     /** Windows 文件时间纪元：1601-01-01 到 1970-01-01 的秒数。 */
     private const val WIN_EPOCH = 11644473600L
 
+    /** 2^32 + 1 —— 原实现用它把 32 位值复制成高低两半。 */
+    private val TWO32_PLUS_1: java.math.BigInteger =
+        java.math.BigInteger.ONE.shiftLeft(32).add(java.math.BigInteger.ONE)
+
     private fun u32(v: Long): Long = v and MASK
 
     private val SHA256_INITIAL = longArrayOf(
@@ -107,10 +111,22 @@ object SecMsGec {
         return ((x ushr 17) xor (x shl 15) xor (x ushr 19) xor (x shl 13) xor (x ushr 10)) and MASK
     }
 
-    /** 循环右移：`(v * (2^32+1)) >> n` 的低 32 位。 */
+    /**
+     * 循环右移，严格对应原实现的 `(v * (2^32+1)) >> n`。
+     *
+     * 【为什么不能写成 `(x ushr n) or (x shl (32-n))`】
+     * 那样在数学上是 32 位循环右移，结果只有 32 位。
+     * 但原实现用的是 BigInt —— `v * (2^32+1)` 把 32 位值复制成高低两半，
+     * 再右移 n 位后，结果**可能超过 32 位**（高位是原值的上半部分）。
+     * 这些多出来的位会参与随后的加法与异或，直到最后才 u32 截断。
+     * 提前截断会算出完全不同的哈希 —— 这正是之前 TTS 一直 403 的根因。
+     *
+     * 用 BigInteger 精确复刻；这个函数只在 TTS 合成时调用，
+     * 每次几十次乘移，开销可忽略。
+     */
     private fun rotr(v: Long, n: Int): Long {
-        val x = u32(v)
-        return ((x ushr n) or (x shl (32 - n))) and MASK
+        val wide = java.math.BigInteger.valueOf(u32(v)).multiply(TWO32_PLUS_1)
+        return wide.shiftRight(n).toLong()
     }
 
     // ───────────────────── 字节工具 ─────────────────────
@@ -155,28 +171,44 @@ object SecMsGec {
         }
     }
 
-    /** schedule 展开用的 sigma1（不取 u32，由调用方截断）。 */
+    /**
+     * schedule 展开用的 sigma1。
+     *
+     * 【必须用 BigInteger】原实现是 `(x >> 17n) ^ (x << 15n) ^ (x >> 19n) ^ (x << 13n) ^ (x >> 10n)`：
+     * · `x << 15n` 会让 BigInt 变长（保留高位）
+     * · `>>` 是**算术右移**，对负数补 1
+     * 两者都不是 32 位循环移位。用 Long 的 `ushr`/`shl` 截断到 32 位会算出不同的哈希。
+     */
     private fun sigma1ForSchedule(v: Long): Long {
-        val x = u32(v)
-        return (x ushr 17) xor (x shl 15) xor (x ushr 19) xor (x shl 13) xor (x ushr 10)
+        val x = big(v)
+        return (x.shiftRight(17) xor x.shiftLeft(15) xor x.shiftRight(19) xor
+            x.shiftLeft(13) xor x.shiftRight(10)).toLong()
     }
 
     private fun sigma0ForSchedule(v: Long): Long {
-        val x = u32(v)
-        return (x ushr 7) xor (x shl 25) xor (x ushr 18) xor (x shl 14) xor (x ushr 3)
+        val x = big(v)
+        return (x.shiftRight(7) xor x.shiftLeft(25) xor x.shiftRight(18) xor
+            x.shiftLeft(14) xor x.shiftRight(3)).toLong()
     }
+
+    private fun big(v: Long): java.math.BigInteger = java.math.BigInteger.valueOf(u32(v))
 
     private fun sha256Init(data: ByteArray): LongArray {
         require(data.size >= 7) { "token salt 至少需要 7 字节" }
 
-        val words = MutableList(30) { 0L }
-        words[14] = ((data[0].toLong() and 0xFF) shl 16) or
+        // 长度必须是 14：原实现是 new Array(14).fill(0n) 然后两次 push，
+        // 于是 words[14]、words[15] 恰好是这两个新值、长度变成 16。
+        // 写成 MutableList(30) 再赋值 [14]/[15] 会让长度仍是 30，
+        // 后面 words.add() 从下标 30 开始加 —— 整个 schedule 索引错位，
+        // 哈希自然全错。这是之前 TTS 一直 403 的第二个根因。
+        val words = MutableList(14) { 0L }
+        words.add(((data[0].toLong() and 0xFF) shl 16) or
             ((data[1].toLong() and 0xFF) shl 8) or
-            (data[2].toLong() and 0xFF)
-        words[15] = ((data[3].toLong() and 0xFF) shl 24) or
+            (data[2].toLong() and 0xFF))
+        words.add(((data[3].toLong() and 0xFF) shl 24) or
             ((data[4].toLong() and 0xFF) shl 16) or
             ((data[5].toLong() and 0xFF) shl 8) or
-            (data[6].toLong() and 0xFF)
+            (data[6].toLong() and 0xFF))
 
         for (index in 16 until 30) {
             var value = SHA256_SCHEDULE[index - 16]
@@ -217,50 +249,43 @@ object SecMsGec {
      * 展开版的运算顺序和中间截断点不同，结果会变。
      */
     private fun sha256Rounds(state: LongArray, words: List<Long>, firstRound: Int = 0): LongArray {
-        var a = state[0]
-        var b = state[1]
-        var c = state[2]
-        var d = state[3]
-        var e = state[4]
-        var f = state[5]
-        var g = state[6]
-        var h = state[7]
+        // 【全程 BigInteger】原实现是 JS BigInt，中间值可以超过 32 位甚至 64 位，
+        // 只在 u32() 处截断。用 Long 承接 rotr 的输出会溢出（实测 rotr 结果常达
+        // 57 位），加法再溢出就彻底错了。这里逐字对应 BigInt 语义。
+        fun big(v: Long) = java.math.BigInteger.valueOf(u32(v))
+        val two32plus1 = TWO32_PLUS_1
+
+        fun rot(v: java.math.BigInteger, n: Int) = v.multiply(two32plus1).shiftRight(n)
+        fun b2l(v: java.math.BigInteger): Long = v.toLong() and MASK
+
+        var a = big(state[0]); var b = big(state[1])
+        var c = big(state[2]); var d = big(state[3])
+        var e = big(state[4]); var f = big(state[5])
+        var g = big(state[6]); var h = big(state[7])
 
         val constants = if (firstRound == 14) SHA256_BLOCK_CONSTANTS else SHA256_ROUND_CONSTANTS
         val aligned = minOf(64, Math.floorDiv(firstRound + 7, 8) * 8)
 
         var index = firstRound
-        while (index < aligned) {
+        while (index < 64) {
+            val eMask = e.xor(f).and(g).let { g.xor(it) }
             val t1 = h +
-                (rotr(e, 6) xor rotr(e, 11) xor rotr(e, 25)) +
-                (g xor (e and (f xor g))) +
-                constants[index] + words[index]
-            val t2 = (rotr(a, 2) xor rotr(a, 13) xor rotr(a, 22)) +
-                ((a and b) or (c and (a or b)))
-            val newA = u32(t1 + t2)
-            h = g; g = f; f = e; e = u32(d + t1); d = c; c = b; b = a; a = newA
+                rot(e, 6).xor(rot(e, 11)).xor(rot(e, 25)) +
+                (g.xor(e.and(f.xor(g)))) +
+                big(constants[index]) + big(words[index])
+            val t2 = rot(a, 2).xor(rot(a, 13)).xor(rot(a, 22)) +
+                (a.and(b)).or(c.and(a.or(b)))
+            val newA = t1.add(t2).toLong() and MASK
+            h = g; g = f; f = e
+            e = big((d.toLong() + t1.toLong()) and MASK)
+            d = c; c = b; b = a; a = big(newA)
             index++
         }
 
-        while (index < 64) {
-            // 一轮 = 原实现的一个 index，8 轮一组手工展开
-            for (step in 0 until 8) {
-                if (index + step >= 64) break
-                val idx = index + step
-                // 手动轮转：每步相当于 [a..h] 左旋转一位
-                val t1 = h +
-                    (rotr(e, 6) xor rotr(e, 11) xor rotr(e, 25)) +
-                    (g xor (e and (f xor g))) +
-                    constants[idx] + words[idx]
-                val t2 = (rotr(a, 2) xor rotr(a, 13) xor rotr(a, 22)) +
-                    ((a and b) or (c and (a or b)))
-                val newA = u32(t1 + t2)
-                h = g; g = f; f = e; e = u32(d + t1); d = c; c = b; b = a; a = newA
-            }
-            index += 8
-        }
-
-        return longArrayOf(a, b, c, d, e, f, g, h)
+        return longArrayOf(
+            a.toLong() and MASK, b.toLong() and MASK, c.toLong() and MASK, d.toLong() and MASK,
+            e.toLong() and MASK, f.toLong() and MASK, g.toLong() and MASK, h.toLong() and MASK,
+        )
     }
 
     private fun sha256Digest(data: ByteArray): ByteArray {
