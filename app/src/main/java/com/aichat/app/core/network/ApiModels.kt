@@ -80,7 +80,10 @@ data class StreamChunk(
 @Serializable
 data class StreamChoice(
     val index: Int = 0,
+    /** 流式响应用这个。 */
     val delta: Delta? = null,
+    /** 非流式响应（服务端无视 stream=true 时）用这个。 */
+    val message: Delta? = null,
     @SerialName("finish_reason") val finishReason: String? = null,
 )
 
