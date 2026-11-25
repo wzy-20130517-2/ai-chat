@@ -65,4 +65,12 @@ data class AppSettings(
     /** TTS 自动朗读开关。 */
     val ttsEnabled: Boolean = false,
     val ttsVoice: String = "zh-CN-XiaoxiaoNeural",
+    /**
+     * 上次正在聊的会话 id。启动时优先恢复它。
+     *
+     * 为什么不用「updatedAt 最新的那个」：新建一个空会话也会刷新 updatedAt，
+     * 于是「上次在聊 A，中途点了一下新对话就退出」会导致 A 丢失焦点。
+     * 显式记录实际进入过的会话更准确。
+     */
+    val lastConversationId: String? = null,
 )

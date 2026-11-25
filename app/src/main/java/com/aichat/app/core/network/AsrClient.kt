@@ -16,16 +16,19 @@ import java.util.concurrent.TimeUnit
 /**
  * 语音识别客户端。
  *
- * 接口形状与 deepseek chat-demo 一致：
- *   POST {base}{path}，multipart 上传 file=WAV，返回 {"text": "..."}
+ * 接口是标准 OpenAI 转写格式（实测确认）：
+ *   POST {base}/audio/transcriptions
+ *   multipart: file=WAV, model=<型号>
+ *   返回 {"text": "...", "duration": 1.0}
+ *
+ * 【型号轮换】
+ * 实测 xingchenasr 几个型号都在线，但单型号偶尔会返回空文本或 5xx。
+ * 按 Config.ASR_MODELS 顺序尝试，任一返回非空文本就采用。
+ * 全部失败才返回 null。
  *
  * WAV 必须是 16kHz 单声道 16-bit PCM（AudioRecorder 产出的就是这个）。
  */
-class AsrClient(
-    private val baseUrl: String = Config.ASR_BASE_URL,
-    private val path: String = Config.ASR_PATH,
-    private val apiKey: String = Config.ASR_API_KEY,
-) {
+class AsrClient {
 
     companion object {
         private const val TAG = "AsrClient"
@@ -33,7 +36,7 @@ class AsrClient(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        // 上传 + 识别：大文件（接近 120 秒上限时约 3.8MB）传上去还要等服务端转写
+        // 上传 + 转写：接近 120 秒上限的录音约 3.8MB，还要等转写
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(90, TimeUnit.SECONDS)
         .build()
@@ -41,24 +44,42 @@ class AsrClient(
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     @Serializable
-    private data class AsrResponse(val text: String? = null)
+    private data class AsrResponse(
+        val text: String? = null,
+        val duration: Double? = null,
+    )
 
     /**
-     * 识别一个 WAV 文件。
+     * 识别一个 WAV 文件，型号按顺序轮换。
      *
-     * @return 识别出的文本；失败返回 null（错误信息写日志，UI 侧只提示"没听清"）
+     * @return 识别出的文本；全部型号都失败返回 null
      */
     suspend fun transcribe(wav: File): String? = withContext(Dispatchers.IO) {
         if (!wav.exists() || wav.length() == 0L) {
             Log.w(TAG, "音频文件为空")
             return@withContext null
         }
-        if (apiKey.isBlank() || apiKey.startsWith("sk-REPLACE")) {
-            Log.w(TAG, "ASR key 未配置")
-            return@withContext null
-        }
 
         try {
+            for (model in Config.ASR_MODELS) {
+                val text = tryModel(wav, model)
+                if (!text.isNullOrBlank()) {
+                    Log.i(TAG, "识别成功（$model）：${text.take(40)}")
+                    return@withContext text
+                }
+                Log.w(TAG, "型号 $model 未返回文本，尝试下一个")
+            }
+            Log.e(TAG, "所有 ASR 型号都失败")
+            null
+        } finally {
+            // 识别完就删，不然缓存目录会越积越多
+            runCatching { wav.delete() }
+        }
+    }
+
+    /** 用指定型号试一次。失败或空文本返回 null。 */
+    private fun tryModel(wav: File, model: String): String? {
+        return try {
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart(
@@ -66,34 +87,32 @@ class AsrClient(
                     "recording.wav",
                     wav.asRequestBody("audio/wav".toMediaType()),
                 )
+                .addFormDataPart("model", model)
                 .build()
 
             val request = Request.Builder()
-                .url("${baseUrl.trimEnd('/')}${path}")
-                .addHeader("Authorization", "Bearer $apiKey")
+                .url("${Config.ASR_BASE_URL.trimEnd('/')}/audio/transcriptions")
+                .addHeader("Authorization", "Bearer ${Config.ASR_API_KEY}")
                 .post(body)
                 .build()
 
             client.newCall(request).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.e(TAG, "识别失败 HTTP ${resp.code}: ${text.take(300)}")
-                    return@withContext null
+                    Log.e(TAG, "$model HTTP ${resp.code}: ${text.take(200)}")
+                    return null
                 }
                 val parsed = try {
                     json.decodeFromString(AsrResponse.serializer(), text)
                 } catch (e: Exception) {
-                    Log.e(TAG, "响应解析失败: ${text.take(300)}", e)
-                    return@withContext null
+                    Log.e(TAG, "$model 响应解析失败: ${text.take(200)}", e)
+                    return null
                 }
                 parsed.text?.trim()?.ifEmpty { null }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "识别异常", e)
+            Log.e(TAG, "$model 异常", e)
             null
-        } finally {
-            // 识别完就删，不然缓存目录会越积越多
-            runCatching { wav.delete() }
         }
     }
 }

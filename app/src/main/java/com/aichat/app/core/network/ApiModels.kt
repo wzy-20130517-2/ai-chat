@@ -23,8 +23,13 @@ data class ChatRequest(
     @SerialName("tool_choice") val toolChoice: String? = null,
     val temperature: Double? = null,
     @SerialName("max_tokens") val maxTokens: Int? = null,
-    /** OpenAI 兼容的 reasoning 开关（部分中转站认这个字段）。 */
-    @SerialName("enable_thinking") val enableThinking: Boolean? = null,
+    /**
+     * 推理强度（OpenAI 协议字段）。
+     *
+     * 关思考传 "none" —— 实测本站会返回 reasoning_len=0，真正不再产生思维链。
+     * 其他取值（minimal/low/medium/high）都会让模型思考并把 reasoning_content 回传。
+     */
+    @SerialName("reasoning_effort") val reasoningEffort: String? = null,
 )
 
 @Serializable

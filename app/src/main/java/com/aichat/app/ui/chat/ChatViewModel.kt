@@ -77,7 +77,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val settings = store.loadSettings()
             val convs = store.loadConversations()
-            val current = convs.maxByOrNull { it.updatedAt }
+
+            // 恢复上次正在聊的会话。
+            // 优先用显式记录的 lastConversationId；它指向的会话可能已被删除，
+            // 这时退回到最近更新的那个；都没有才新建。
+            val current = convs.firstOrNull { it.id == settings.lastConversationId }
+                ?: convs.maxByOrNull { it.updatedAt }
 
             _state.value = _state.value.copy(
                 settings = settings,
@@ -88,8 +93,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             if (current == null) {
                 createConversation()
+            } else if (current.id != settings.lastConversationId) {
+                // 修正记录，避免下次又走 fallback
+                persistLastConversation(current.id)
             }
         }
+    }
+
+    /** 记录「当前正在聊的会话」，用于下次启动恢复。 */
+    private fun persistLastConversation(id: String) {
+        val s = _state.value.settings.copy(lastConversationId = id)
+        _state.value = _state.value.copy(settings = s)
+        viewModelScope.launch { store.saveSettings(s) }
     }
 
     // ─────────── 输入 ───────────
@@ -133,6 +148,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             input = "",
             drawerOpen = false,
         )
+        persistLastConversation(conv.id)
         viewModelScope.launch { store.saveConversations(list) }
     }
 
@@ -147,6 +163,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             isStreaming = false,
             drawerOpen = false,
         )
+        persistLastConversation(id)
     }
 
     fun deleteConversation(id: String) {
@@ -310,22 +327,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val pendingCalls = mutableListOf<ToolCall>()
                 var failed = false
 
+                // 每轮从「空内容」起算。重试时 LlmClient 内部可能已经跑过几次，
+                // 但那些内容不会到我们这里 —— 我们只在真正收到时累积。
+                // 这里显式清空可以避免上一轮正文串到这一轮。
+                val baseContent = assistantMsg.content
+                val baseReasoning = assistantMsg.reasoning
+
                 val ttsOn = _state.value.settings.ttsEnabled
                 if (ttsOn) {
                     tts.startStream(_state.value.settings.ttsVoice)
                 }
 
+                val thinkingOn = _state.value.settings.deepThinking
                 llm.stream(
                     messages = buildApiMessages(working),
                     tools = tools.specs(),
-                    deepThinking = _state.value.settings.deepThinking,
+                    deepThinking = thinkingOn,
+                    // 关闭思考时即使模型返回思维链也不展示（部分站默认会返回）
+                    hideReasoning = !thinkingOn,
                 ).collect { ev ->
                     when (ev) {
                         is StreamEvent.Content -> {
                             turnContent.append(ev.text)
                             if (ttsOn) tts.feed(ev.text)
                             assistantMsg = assistantMsg.copy(
-                                content = assistantMsg.content + ev.text,
+                                content = baseContent + turnContent.toString(),
                                 streaming = true,
                             )
                             replaceLast(assistantMsg)
@@ -334,7 +360,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         is StreamEvent.Reasoning -> {
                             turnReasoning.append(ev.text)
                             assistantMsg = assistantMsg.copy(
-                                reasoning = assistantMsg.reasoning + ev.text,
+                                reasoning = baseReasoning + turnReasoning.toString(),
                                 streaming = true,
                             )
                             replaceLast(assistantMsg)
@@ -345,9 +371,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         }
 
                         is StreamEvent.Retrying -> {
-                            _state.value = _state.value.copy(
-                                helperText = "连接不稳，重试 ${ev.attempt}/${ev.max}…",
-                            )
+                            _state.value = _state.value.copy(helperText = ev.message)
                         }
 
                         is StreamEvent.Failed -> {
