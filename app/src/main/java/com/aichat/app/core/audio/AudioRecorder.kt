@@ -5,7 +5,6 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
-import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.concurrent.thread
 
@@ -36,6 +35,9 @@ class AudioRecorder {
 
         /** ASR 单次时长上限 120 秒（接口硬限制，超了会被拒）。 */
         const val MAX_DURATION_MS = 120_000L
+
+        /** PCM 缓冲初始容量：16kHz * 2 字节 * 8 秒 ≈ 256KB，常见短语音不用扩容。 */
+        private const val INITIAL_CAPACITY = 16000 * 2 * 8
     }
 
     private var audioRecord: AudioRecord? = null
@@ -47,7 +49,20 @@ class AudioRecorder {
     @Volatile
     private var stopRequested = false
 
-    private val pcmBuffer = ByteArrayOutputStream()
+    /**
+     * PCM 累积缓冲。
+     *
+     * 【为什么不用 ByteArrayOutputStream】
+     * 它内部是「数组 + 每次扩容 copyOf」，而且最后 toByteArray() 还要再整份拷一次。
+     * 6 秒录音约 190KB 不痛不痒，但 120 秒上限是 3.8MB —— 收尾时要多拷两遍，
+     * 松手到出字的延迟里有一部分就耗在这。
+     *
+     * 改成「预估容量一次性分配 + write 时逐段写入」：
+     * 120 秒的容量按需增长（每次翻倍），最终写出文件时只需一次 copyInto。
+     */
+    private val lock = Any()
+    private var pcmData = ByteArray(INITIAL_CAPACITY)
+    private var pcmLength = 0
 
     /** 已录制时长（毫秒），供 UI 显示读秒。 */
     @Volatile
@@ -72,9 +87,16 @@ class AudioRecorder {
             return false
         }
 
-        // 缓冲区给到最小值的 4 倍：太小会导致 read 频繁返回、增大爆音概率；
-        // 太大则延迟高（push-to-talk 松手后还要读很久才结束）。
-        val bufSize = minBuf * 4
+        // 【2026-11-25 改】原来是 minBuf * 4。
+        //
+        // AudioRecord.read 是阻塞的：松手时读线程可能正卡在一次 read 里，
+        // 要等这个缓冲区被填满才返回。缓冲区越大，join 最长等待越久 ——
+        // 4 倍时理论最坏要等约 0.5 秒，体感就是「松手后卡一下才开始识别」。
+        //
+        // 改成 minBuf（且不小于 2048 字节，约 64ms）：
+        // 保证不欠采样（低于 minBuf 会丢帧爆音），同时把 join 的最长等待压到
+        // 几十毫秒级。read 调用频率略高，但对 16kHz 单声道来说 CPU 开销可忽略。
+        val bufSize = maxOf(minBuf, 2048)
 
         val record = try {
             AudioRecord(
@@ -95,7 +117,7 @@ class AudioRecorder {
             return false
         }
 
-        pcmBuffer.reset()
+        synchronized(lock) { pcmLength = 0 }
         recordedMs = 0
         stopRequested = false
         recording = true
@@ -125,7 +147,16 @@ class AudioRecorder {
                         bytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
                         i++
                     }
-                    synchronized(pcmBuffer) { pcmBuffer.write(bytes) }
+                    synchronized(lock) {
+                        if (pcmLength + bytes.size > pcmData.size) {
+                            // 翻倍扩容，够 120 秒上限时最多扩 10 次
+                            var cap = pcmData.size
+                            while (cap < pcmLength + bytes.size) cap *= 2
+                            pcmData = pcmData.copyOf(cap)
+                        }
+                        bytes.copyInto(pcmData, pcmLength)
+                        pcmLength += bytes.size
+                    }
                     totalSamples += read
                     recordedMs = totalSamples * 1000L / SAMPLE_RATE
 
@@ -173,15 +204,20 @@ class AudioRecorder {
         }
         audioRecord = null
 
-        val pcm = synchronized(pcmBuffer) { pcmBuffer.toByteArray() }
-        pcmBuffer.reset()
+        val (pcm, len) = synchronized(lock) {
+            val snapshot = pcmData
+            val n = pcmLength
+            pcmLength = 0
+            snapshot to n
+        }
 
         // 空录音（按一下就松）不上传 —— 服务端只会返回空串，还浪费一次请求
-        if (pcm.isEmpty()) return null
+        if (len == 0) return null
 
         val out = File(cacheDir, "voice_${System.currentTimeMillis()}.wav")
         return try {
-            out.writeBytes(buildWav(pcm))
+            // 直接按最终长度拼一次，不再有中间拷贝
+            out.writeBytes(buildWav(pcm, len))
             out
         } catch (e: Exception) {
             Log.e(TAG, "写 WAV 失败", e)
@@ -211,7 +247,7 @@ class AudioRecorder {
             }
         }
         audioRecord = null
-        synchronized(pcmBuffer) { pcmBuffer.reset() }
+        synchronized(lock) { pcmLength = 0 }
         recordedMs = 0
     }
 
@@ -221,12 +257,12 @@ class AudioRecorder {
      * 字段顺序与 chat-demo 的 encodeWav 完全一致：ASR 侧按这个头解析，
      * 少一个字段或字节序写反都会导致「文件能播放但识别失败」这种难查的问题。
      */
-    private fun buildWav(pcm: ByteArray): ByteArray {
+    private fun buildWav(pcm: ByteArray, pcmSize: Int): ByteArray {
         val channels = 1
         val bitsPerSample = 16
         val byteRate = SAMPLE_RATE * channels * bitsPerSample / 8
         val blockAlign = channels * bitsPerSample / 8
-        val dataSize = pcm.size
+        val dataSize = pcmSize
         val out = ByteArray(44 + dataSize)
 
         fun putAscii(offset: Int, s: String) {
@@ -256,7 +292,7 @@ class AudioRecorder {
         putInt16LE(34, bitsPerSample)
         putAscii(36, "data")
         putInt32LE(40, dataSize)
-        pcm.copyInto(out, 44)
+        pcm.copyInto(out, 44, 0, dataSize)
 
         return out
     }

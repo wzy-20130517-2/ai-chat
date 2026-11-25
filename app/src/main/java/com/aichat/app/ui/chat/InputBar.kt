@@ -136,7 +136,12 @@ fun InputBar(
                         // 长按录音：只在可输入且没在流式输出时启用
                         .longPressToTalk(
                             enabled = speechAvailable && !isStreaming,
-                            onClick = { focusRequester.requestFocus() },
+                            onClick = {
+                                // 兜底：极端时序下（比如界面尚未完成首次组合）
+                                // focusRequester 仍可能没有附着点，这里不该让 App 崩掉。
+                                // 正常情况走不到 catch —— 输入框已改成常驻。
+                                runCatching { focusRequester.requestFocus() }
+                            },
                             onStart = onRecordStart,
                             onStop = onRecordStop,
                             onCancel = onRecordCancel,
@@ -157,13 +162,24 @@ fun InputBar(
                                 Text("正在识别…", style = ChatText.body, color = colors.textTertiary)
                             }
                         RecordingState.IDLE ->
-                            if (text.isEmpty()) {
-                                Text(
-                                    text = if (speechAvailable) "发消息，或长按说话" else "发消息",
-                                    style = ChatText.body,
-                                    color = colors.textTertiary,
-                                )
-                            } else {
+                            // 【2026-11-25 修崩溃】BasicTextField 必须始终存在。
+                            //
+                            // 原来是 `if (text.isEmpty()) Text(占位) else BasicTextField(...)`，
+                            // 而 focusRequester 只挂在 BasicTextField 上 —— 输入框为空时
+                            // 那个节点根本没被组合出来，长按手势里的
+                            // `focusRequester.requestFocus()` 就会抛
+                            // "FocusRequester is not initialized"。
+                            //
+                            // 改成：输入框常驻，占位文字用 Box 叠在它上面（空文本时才显示）。
+                            // 这样 focusRequester 永远有附着点。
+                            Box(modifier = Modifier.fillMaxWidth()) {
+                                if (text.isEmpty()) {
+                                    Text(
+                                        text = if (speechAvailable) "发消息，或长按说话" else "发消息",
+                                        style = ChatText.body,
+                                        color = colors.textTertiary,
+                                    )
+                                }
                                 BasicTextField(
                                     value = text,
                                     onValueChange = onTextChange,
