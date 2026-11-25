@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -218,57 +220,88 @@ private fun TopBar(
     onOpenDrawer: () -> Unit,
 ) {
     val colors = LocalChatColors.current
-    Row(
+    // 顶栏要避让状态栏：之前直接把 Row 放在 Column 顶部，
+    // edge-to-edge 下整条会顶到屏幕最上沿，按钮被状态栏盖住点不到。
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(52.dp)
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .height(52.dp),
     ) {
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .clickable { onOpenDrawer() },
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(Icons.Default.Menu, "会话列表", tint = colors.textSecondary, modifier = Modifier.size(20.dp))
-        }
-
+        // 标题用「整行居中」而不是 weight 占位居中。
+        // 左边 1 个图标、右边 2 个图标，weight(1f) 会让文字落在剩余空间的中心，
+        // 视觉上明显偏右。直接铺满整行居中才和 ChatGPT 一致。
         Text(
             text = title,
             style = ChatText.title,
             color = colors.textPrimary,
             maxLines = 1,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 4.dp),
+            overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                // 左右各留出按钮宽度，避免长标题压到图标上
+                .padding(horizontal = 52.dp)
+                .align(Alignment.Center),
         )
 
-        Box(
+        Row(
             modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .clickable { onToggleTts() },
-            contentAlignment = Alignment.Center,
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp)
+                .align(Alignment.CenterStart),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                imageVector = Icons.Default.VolumeUp,
-                contentDescription = if (ttsEnabled) "关闭朗读" else "开启朗读",
-                tint = if (ttsEnabled) colors.textPrimary else colors.textTertiary,
-                modifier = Modifier.size(20.dp),
-            )
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onOpenDrawer() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Menu, "会话列表",
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
         }
 
-        Box(
+        Row(
             modifier = Modifier
-                .size(40.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .clickable { onNewChat() },
-            contentAlignment = Alignment.Center,
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp)
+                .align(Alignment.CenterEnd),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(Icons.Default.Add, "新对话", tint = colors.textSecondary, modifier = Modifier.size(22.dp))
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onToggleTts() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Default.VolumeUp,
+                    contentDescription = if (ttsEnabled) "关闭朗读" else "开启朗读",
+                    tint = if (ttsEnabled) colors.textPrimary else colors.textTertiary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { onNewChat() },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Default.Add, "新对话",
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
         }
     }
 }
