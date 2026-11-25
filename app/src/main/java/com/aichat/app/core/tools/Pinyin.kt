@@ -20,19 +20,6 @@ package com.aichat.app.core.tools
 object Pinyin {
 
     /**
-     * 声母表索引。GB2312 一级汉字按拼音排序，这些界限字是各声母起始位置的锚点。
-     * 用「锚点字 + 序」算出某字的拼音首字母，比逐字码表省空间。
-     */
-    private val INITIAL_BOUNDARIES = arrayOf(
-        '啊' to "a", '芭' to "b", '擦' to "c", '搭' to "d",
-        '蛾' to "e", '发' to "f", '噶' to "g", '哈' to "h",
-        '击' to "j", '喀' to "k", '垃' to "l", '妈' to "m",
-        '拿' to "n", '哦' to "o", '啪' to "p", '期' to "q",
-        '然' to "r", '撒' to "s", '塌' to "t", '挖' to "w",
-        '昔' to "x", '压' to "y", '匝' to "z",
-    )
-
-    /**
      * 常用字全拼表。
      *
      * 只覆盖通讯录里高频出现的字（姓氏 + 常见名用字）。这不追求完整性 ——
@@ -226,21 +213,20 @@ object Pinyin {
         if (ch.code < 0x4E00 || ch.code > 0x9FA5) {
             return if (ch.isLetterOrDigit()) ch.lowercaseChar().toString() else null
         }
-        FULL_PINYIN[ch]?.let { return it }
-        // 兜底：用声母锚点表估一个首字母。
-        // 只给首字母而不是瞎猜全拼 —— 错的比缺的更糟。
-        return initialOf(ch)
+        // 查不到就返回 null，不做猜测。
+        // 之前这里用「编码区间锚点表」估首字母，结果王芳→"ad"、李四→"aa" 全错 ——
+        // 汉字编码顺序和拼音声母根本不对应。错的比缺的更糟，直接给 null。
+        return FULL_PINYIN[ch]
     }
 
-    /** 只取声母首字母。 */
-    fun initialOf(ch: Char): String? {
-        if (ch.code < 0x4E00 || ch.code > 0x9FA5) return null
-        var result: String? = null
-        for ((anchor, letter) in INITIAL_BOUNDARIES) {
-            if (ch >= anchor) result = letter else break
-        }
-        return result
-    }
+    /**
+     * 只取拼音首字母。
+     *
+     * 【为什么不用「编码区间锚点表」】之前那版按 GB2312 的编码顺序猜声母，
+     * 结果王芳 → "ad"、李四 → "aa"，全错（汉字编码顺序与拼音声母不对应）。
+     * 直接查全拼表取首字母才可靠；查不到就返回 null，不做瞎猜。
+     */
+    fun initialOf(ch: Char): String? = of(ch)?.firstOrNull()?.toString()
 
     /** 整个字符串的全拼（每个字拼接）。有任一字查不到就返回 null。 */
     fun fullOf(s: String): String? {
