@@ -195,6 +195,8 @@ class LlmClient {
         var contentLen = 0
         var toolCallCount = 0
         var finishReason = ""
+        // 提到 try 外面：catch 块里也要判断是否已经收到过工具调用
+        val toolAcc = mutableMapOf<Int, ToolAccumulator>()
 
         try {
             val reqBody = ChatRequest(
@@ -229,7 +231,6 @@ class LlmClient {
             }
 
             val source = response.body!!.source()
-            val toolAcc = mutableMapOf<Int, ToolAccumulator>()
 
             try {
                 // 【2026-11-25 修·最终】
