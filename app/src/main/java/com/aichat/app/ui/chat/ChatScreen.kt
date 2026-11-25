@@ -50,6 +50,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.aichat.app.core.data.Message
+import com.aichat.app.core.data.Role
 import com.aichat.app.ui.theme.ChatText
 import com.aichat.app.ui.theme.LocalChatColors
 import kotlinx.coroutines.flow.filter
@@ -96,6 +97,11 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val density = LocalDensity.current
 
+    // UI 只渲染可见消息。Role.TOOL 是给模型看的工具结果（协议要求必须存在），
+    // 显示成气泡没有意义。滚动/空状态/下标计算都必须基于这个列表，
+    // 否则 lastIndex 会指到不可见的 TOOL 上，出现「滚到底但停在中间」。
+    val visible = remember(messages) { messages.filter { it.role != Role.TOOL } }
+
     // 「是否跟随底部」。初值 true，因为打开会话默认就该在底部。
     val shouldFollow by remember {
         derivedStateOf {
@@ -109,11 +115,11 @@ fun ChatScreen(
 
     // 自动滚动：只在「跟随」状态下、且内容变化时滚到底
     LaunchedEffect(listState, shouldFollow) {
-        snapshotFlow { messages.size to messages.lastOrNull()?.content?.length }
+        snapshotFlow { visible.size to visible.lastOrNull()?.content?.length }
             .filter { shouldFollow }
             .collect {
-                if (messages.isNotEmpty()) {
-                    listState.animateScrollToItem(messages.lastIndex)
+                if (visible.isNotEmpty()) {
+                    listState.animateScrollToItem(visible.lastIndex)
                 }
             }
     }
@@ -134,7 +140,7 @@ fun ChatScreen(
 
             // ── 消息区 ──
             Box(modifier = Modifier.weight(1f)) {
-                if (messages.isEmpty()) {
+                if (visible.isEmpty()) {
                     EmptyState(colors)
                 } else {
                     LazyColumn(
@@ -145,7 +151,10 @@ fun ChatScreen(
                         ),
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                     ) {
-                        items(messages, key = { it.id }) { msg ->
+                        // 过滤掉 Role.TOOL：它是「喂给模型」的内部消息（工具执行结果），
+                        // 不该显示成气泡。不过滤的话每轮工具调用都会在界面上
+                        // 留下一个不可见的空位，表现为莫名多出来的间隔。
+                        items(visible, key = { it.id }) { msg ->
                             MessageBubble(
                                 message = msg,
                                 deepThinking = deepThinking,
@@ -175,8 +184,8 @@ fun ChatScreen(
                             .background(colors.bgElevated)
                             .clickable {
                                 scope.launch {
-                                    if (messages.isNotEmpty()) {
-                                        listState.animateScrollToItem(messages.lastIndex)
+                                    if (visible.isNotEmpty()) {
+                                        listState.animateScrollToItem(visible.lastIndex)
                                     }
                                 }
                             },
