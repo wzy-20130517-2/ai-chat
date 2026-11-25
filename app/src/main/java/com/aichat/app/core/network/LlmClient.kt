@@ -252,7 +252,27 @@ class LlmClient {
                     }
 
                     val choice = chunk.choices.firstOrNull() ?: continue
-                    val delta = choice.delta
+
+                    // 非流式响应（服务端无视 stream=true）把内容放在 message 里，
+                    // 流式放在 delta 里。统一成 delta 的形状处理，两条路都能出字。
+                    val delta = choice.delta ?: choice.message?.let { m ->
+                        Delta(
+                            role = m.role,
+                            content = m.content,
+                            reasoningContent = m.reasoningContent,
+                            toolCalls = m.toolCalls?.mapIndexed { i, tc ->
+                                DeltaToolCall(
+                                    index = i,
+                                    id = tc.id,
+                                    type = tc.type,
+                                    function = DeltaFunction(
+                                        name = tc.function.name,
+                                        arguments = tc.function.arguments,
+                                    ),
+                                )
+                            },
+                        )
+                    }
 
                     if (delta != null) {
                         // 思维链：只在开启深度思考时展示
@@ -338,18 +358,39 @@ class LlmClient {
      * 那样会被上层当成「流结束」，长耗时模型（先思考再回答）会在
      * 首字回来之前就被误判成空回答。
      */
+    /**
+     * 读下一行待解析的 JSON。
+     *
+     * 两种情况都要能处理：
+     *   1) 标准 SSE：`data: {...}`（本函数剥掉前缀返回 JSON 本体）
+     *   2) 服务端无视 stream=true、直接回一整段普通 JSON
+     *      这种行不以 `data:` 开头，上一版会把它当心跳跳过 →
+     *      读到 EOF 时 contentLen 仍是 0 → 误报「返回了空内容」。
+     *
+     * 按 `Path:`/`X-`/`:` 开头的 SSE 控制行仍然跳过，它们不是数据。
+     */
     private fun readNextDataLine(
         source: okio.BufferedSource,
         json: Json,
     ): String? {
         while (true) {
             val raw = source.readUtf8Line() ?: return null
-            if (raw.isBlank()) continue
-            if (!raw.startsWith("data:")) continue
-            val payload = raw.removePrefix("data:").trim()
-            if (payload.isEmpty()) continue
-            if (payload == "[DONE]") return DONE
-            return payload
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) continue
+
+            if (trimmed.startsWith("data:")) {
+                val payload = trimmed.removePrefix("data:").trim()
+                if (payload.isEmpty()) continue
+                if (payload == "[DONE]") return DONE
+                return payload
+            }
+
+            // 非 data: 行：SSE 控制行（event:/id:/retry:/心跳注释）跳过，
+            // 而裸 JSON 直接当数据返回。
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                return trimmed
+            }
+            continue
         }
     }
 
