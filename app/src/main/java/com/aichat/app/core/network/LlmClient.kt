@@ -190,6 +190,7 @@ class LlmClient {
                 stream = true,
                 tools = tools,
                 toolChoice = if (tools != null) "auto" else null,
+                maxTokens = Config.MAX_OUTPUT_TOKENS,
                 // 关思考传 "none"（实测本站返回 reasoning_len=0，真的不再思考）。
                 // 开关思考时给 "medium"。仍然保留 hideReasoning 兜底：
                 // 换到别的站点时 "none" 未必认，靠展示层过滤保证用户看不到。
