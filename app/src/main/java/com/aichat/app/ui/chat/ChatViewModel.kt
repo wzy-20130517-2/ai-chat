@@ -75,6 +75,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
 
     init {
+        // TTS 失败时把原因显示到输入框上方
+        tts.onError = { msg ->
+            _state.value = _state.value.copy(helperText = msg)
+        }
+
         viewModelScope.launch {
             val settings = store.loadSettings()
             // 只读摘要，不解析每个会话的消息 —— 会话多了以后全量解析会拖慢启动
