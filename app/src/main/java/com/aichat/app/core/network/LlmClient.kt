@@ -52,6 +52,44 @@ class LlmClient {
 
     companion object {
         private const val TAG = "LlmClient"
+
+        /**
+         * 主线路的冷却截止时间（毫秒时间戳）。0 = 不在冷却。
+         *
+         * 【为什么需要】主站在一段时间内不稳定时（限流、临时 5xx），
+         * 如果每次请求都先试主站、等它失败、再降级，用户每次都要多等十几秒。
+         * 记录「主线路刚刚连续失败」，在冷却期内直接走备用，体感快很多。
+         *
+         * 只对第 0 个端点（主线路）生效 —— 备用线路本来就是兜底，不参与冷却。
+         */
+        @Volatile
+        private var primaryCooldownUntil = 0L
+
+        /** 主线路连续失败几次后进入冷却。 */
+        private const val PRIMARY_FAIL_THRESHOLD = 2
+
+        /** 冷却时长：30 分钟。 */
+        private const val COOLDOWN_MS = 30 * 60 * 1000L
+
+        /** 主线路连续失败计数。 */
+        @Volatile
+        private var primaryFailCount = 0
+
+        private fun isPrimaryCoolingDown(): Boolean =
+            System.currentTimeMillis() < primaryCooldownUntil
+
+        private fun markPrimaryFailed() {
+            primaryFailCount++
+            if (primaryFailCount >= PRIMARY_FAIL_THRESHOLD) {
+                primaryCooldownUntil = System.currentTimeMillis() + COOLDOWN_MS
+                Log.w(TAG, "主线路连续失败 $primaryFailCount 次，冷却 30 分钟")
+            }
+        }
+
+        private fun markPrimaryOk() {
+            primaryFailCount = 0
+            primaryCooldownUntil = 0L
+        }
     }
 
     /**
@@ -99,6 +137,13 @@ class LlmClient {
         var lastError = ""
 
         for ((endpointIdx, endpoint) in Config.LLM_ENDPOINTS.withIndex()) {
+            // 主线路冷却中就直接跳过（省掉一次注定失败的等待）
+            if (endpointIdx == 0 && isPrimaryCoolingDown()) {
+                val leftMin = ((primaryCooldownUntil - System.currentTimeMillis()) / 60000).coerceAtLeast(1)
+                trySend(StreamEvent.Retrying("主线路冷却中（剩余约 ${leftMin} 分钟），使用备用线路"))
+                continue
+            }
+
             var timeoutTries = 0
             var emptyTries = 0
 
@@ -120,6 +165,7 @@ class LlmClient {
 
                 when (outcome) {
                     is Outcome.Success -> {
+                        if (endpointIdx == 0) markPrimaryOk()
                         close()
                         return@callbackFlow
                     }
@@ -157,6 +203,7 @@ class LlmClient {
 
                     is Outcome.HardFail -> {
                         lastError = outcome.message
+                        if (endpointIdx == 0) markPrimaryFailed()
                         break
                     }
                 }
