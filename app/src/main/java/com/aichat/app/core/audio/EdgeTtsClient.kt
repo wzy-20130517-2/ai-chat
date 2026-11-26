@@ -42,6 +42,8 @@ class EdgeTtsClient(
          * 143 是当前验证可用的版本，跟着 rany2/edge-tts 走。
          */
         private const val CHROME_VERSION = "143.0.3650.75"
+        /** User-Agent 里用的是主版本号。 */
+        private const val CHROME_MAJOR = "143"
 
         private const val WSS_HOST = "speech.platform.bing.com"
         private const val WSS_PATH = "/consumer/speech/synthesize/readaloud/edge/v1"
@@ -80,13 +82,38 @@ class EdgeTtsClient(
         val mp3 = java.io.ByteArrayOutputStream()
 
         val url = buildUrl()
-        val request = Request.Builder().url(url).build()
+        // 【必须补齐这些头，少一项就 403】
+        // 微软的服务端会校验请求是不是真的来自 Edge 浏览器的「大声朗读」功能。
+        // CCM 的 Node 实现注释里写得很明确：
+        //   Origin / Cookie / User-Agent / Cache-Control 等，少一项就 403。
+        // OkHttp 的 WebSocket 默认只发 RFC6455 规定的标准头，
+        // 所以握手会被直接拒掉 —— 这是「语音合成失败」的根因。
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/$CHROME_MAJOR.0.0.0 Safari/537.36 " +
+            "Edg/$CHROME_MAJOR.0.0.0"
+        val muid = UUID.randomUUID().toString().replace("-", "").uppercase()
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Pragma", "no-cache")
+            .header("Cache-Control", "no-cache")
+            .header("Origin", "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")
+            .header("User-Agent", ua)
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            .header("Cookie", "muid=$muid;")
+            .build()
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 // 1) 配置帧
+                // 【格式必须和 CCM 一致】Node 那边是
+                //   new Date().toUTCString().replace('GMT', 'GMT+0000 (...)')
+                // 输出形如 "Thu, 26 Nov 2026 03:59:09 GMT+0000 (...)" ——
+                // 注意日期后面**有逗号**（RFC 1123 格式）。
+                // 之前写成 "EEE MMM dd yyyy"（缺逗号）会被服务端判为非法时间戳。
                 val ts = java.text.SimpleDateFormat(
-                    "EEE MMM dd yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'",
+                    "EEE, dd MMM yyyy HH:mm:ss 'GMT+0000 (Coordinated Universal Time)'",
                     java.util.Locale.US,
                 ).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }.format(java.util.Date())
 
