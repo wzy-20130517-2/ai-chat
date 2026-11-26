@@ -35,8 +35,14 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun Modifier.longPressToTalk(
     enabled: Boolean = true,
     longPressMs: Long = 400L,
-    /** 滑出多远算「取消」（像素）。默认 120px，约 40dp。 */
-    cancelThresholdPx: Float = 120f,
+    /**
+     * 滑出多远算「取消」。
+     *
+     * 【为什么用 dp 而不是像素】120px 在高密度屏上只有 40dp 左右 ——
+     * 手指按着说话时轻微动一下就超过，太容易误取消。
+     * 改成 96dp（约手指抬高 1.5cm 的距离），既不容易误触，又还滑得出去。
+     */
+    cancelThresholdDp: Float = 96f,
     onClick: () -> Unit = {},
     onStart: () -> Unit = {},
     onStop: () -> Unit = {},
@@ -44,7 +50,9 @@ fun Modifier.longPressToTalk(
 ): Modifier = composed {
     if (!enabled) return@composed this
 
-    this.pointerInput(enabled, longPressMs, cancelThresholdPx) {
+    this.pointerInput(enabled, longPressMs, cancelThresholdDp) {
+        // dp → px：在 pointerInput 作用域里能拿到 density
+        val cancelThresholdPx = cancelThresholdDp * density
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false)
             val downPos = down.position
